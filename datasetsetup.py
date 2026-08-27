@@ -1,12 +1,16 @@
-"""Prepare SWED images and masks for training a segmentation model.
+"""
+Prepare SWED images and masks for training a segmentation model.
 
-The workflow is: match every satellite image with its mask, split the data
+The workflow is:
+match every satellite image with its mask, split the data
 into training and validation sets, normalize the image bands, and create
 PyTorch datasets. A separate test set is also created for final evaluation.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import combinations
+import logging
 from pathlib import Path
 import random
 import numpy as np
@@ -29,12 +33,22 @@ SUPPORTED_EXTENSIONS = {".npy", ".tif", ".tiff"}
 # SWED: B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B11, B12.
 # SATLAS Sentinel2_*_SI_MS: R, G, B, B05, B06, B07, B08, B11, B12.
 SATLAS_BAND_INDICES = (3, 2, 1, 4, 5, 6, 7, 10, 11)
-SATLAS_BAND_NAMES = ("B04", "B03", "B02", "B05", "B06", "B07", "B08", "B11", "B12")
 SATLAS_REFLECTANCE_SCALE = 8160.0
 
 
+class _IgnoreInvalidGDALNoDataTag(logging.Filter):
+    """Hide only tifffile's harmless, out-of-range GDAL_NODATA tag warning."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "parsing GDAL_NODATA tag raised" not in record.getMessage()
+
+
+_TIFFFILE_LOG_FILTER = _IgnoreInvalidGDALNoDataTag()
+
+
 def _sample_id(path: Path, markers: tuple[str, ...]) -> str | None:
-    """Return the ID used to match an image file with its label file.
+    """
+    Return the ID used to match an image file with its label file.
 
     The image and label filenames contain different markers. Replacing that
     marker with ``_`` leaves the common part of the two filenames. If none of
@@ -47,7 +61,8 @@ def _sample_id(path: Path, markers: tuple[str, ...]) -> str | None:
 
 
 def _index_files(directory: Path, markers: tuple[str, ...]) -> dict[str, Path]:
-    """Map each valid sample ID to its file inside a directory.
+    """
+    Map each valid sample ID to its file inside a directory.
 
     Unsupported files and files without a known marker are ignored. Duplicate
     IDs raise an error because they would make image-label pairing ambiguous.
@@ -65,13 +80,21 @@ def _index_files(directory: Path, markers: tuple[str, ...]) -> dict[str, Path]:
     return indexed
 
 
-def get_pairs(images_dir: str | Path, labels_dir: str | Path) -> pd.DataFrame:
-    """Match every image with its label and return the pairs in a DataFrame.
+def get_pairs(
+    images_dir: str | Path,
+    labels_dir: str | Path,
+    validate_images: bool = False,
+) -> pd.DataFrame:
+    """
+    Match every image with its label and return the valid pairs.
 
     Each output row contains the sample ID, image path, and label path. Files
     are matched by the ID in their names, not by their position in a directory
-    listing. An error is raised if a directory is invalid or a file has no
-    matching partner.
+    listing. By default, pairs whose masks are not 256x256 binary arrays are
+    discarded immediately, before they can enter train, validation, or test.
+    ``validate_images=True`` additionally excludes unreadable images, invalid
+    shapes, NaN/Inf values, and negative nodata pixels. An error is raised if
+    a directory is invalid or a file has no partner.
     """
     images_dir = Path(images_dir)
     labels_dir = Path(labels_dir)
@@ -96,7 +119,7 @@ def get_pairs(images_dir: str | Path, labels_dir: str | Path) -> pd.DataFrame:
             f"label senza immagine: {missing_images[:5]}"
         )
 
-    return pd.DataFrame(
+    pairs = pd.DataFrame(
         {
             "sample_id": sample_id,
             "image_path": images[sample_id],
@@ -104,6 +127,8 @@ def get_pairs(images_dir: str | Path, labels_dir: str | Path) -> pd.DataFrame:
         }
         for sample_id in sorted(images)
     )
+    valid_pairs = filter_invalid_masks(pairs)
+    return filter_invalid_images(valid_pairs) if validate_images else valid_pairs
 
 
 def split_pairs(
@@ -111,7 +136,8 @@ def split_pairs(
     train_fraction: float = 0.8,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Divide paired samples into training and validation sets.
+    """
+    Divide paired samples into training and validation sets.
 
     All tiles from the same satellite scene stay in the same set. This avoids
     evaluating the model on tiles that are very similar to its training data.
@@ -132,17 +158,105 @@ def split_pairs(
     scenes = sorted(frame["scene_id"].unique())
     if len(scenes) < 2:
         raise ValueError("Servono almeno due scene per creare train e validation")
-    random.Random(seed).shuffle(scenes)
     split_at = min(max(round(len(scenes) * train_fraction), 1), len(scenes) - 1)
-    train_scenes = set(scenes[:split_at])
+    validation_scene_count = len(scenes) - split_at
+
+    if {"water_pixels", "total_pixels"}.issubset(frame.columns):
+        # Choose complete validation scenes while matching both dataset size
+        # and water prevalence. This reduces class-prior shift without leaking
+        # adjacent tiles from the same scene across the two subsets.
+        scene_stats = frame.groupby("scene_id")[["water_pixels", "total_pixels"]].sum()
+        target_samples = len(frame) * (1.0 - train_fraction)
+        target_water_fraction = frame["water_pixels"].sum() / frame["total_pixels"].sum()
+        shuffled_scenes = scenes.copy()
+        random.Random(seed).shuffle(shuffled_scenes)
+
+        best_score = float("inf")
+        validation_scenes: set[str] = set()
+        for candidate in combinations(shuffled_scenes, validation_scene_count):
+            candidate_frame = frame[frame["scene_id"].isin(candidate)]
+            candidate_stats = scene_stats.loc[list(candidate)].sum()
+            size_error = abs(len(candidate_frame) - target_samples) / len(frame)
+            water_fraction = (
+                candidate_stats["water_pixels"] / candidate_stats["total_pixels"]
+            )
+            prevalence_error = abs(water_fraction - target_water_fraction)
+            score = float(size_error + prevalence_error)
+            if score < best_score:
+                best_score = score
+                validation_scenes = set(candidate)
+        train_scenes = set(scenes) - validation_scenes
+    else:
+        # Preserve support for callers that provide only paths/sample IDs.
+        random.Random(seed).shuffle(scenes)
+        train_scenes = set(scenes[:split_at])
 
     train = frame[frame["scene_id"].isin(train_scenes)].reset_index(drop=True)
     validation = frame[~frame["scene_id"].isin(train_scenes)].reset_index(drop=True)
     return train, validation
 
 
+def filter_invalid_masks(pairs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Discard samples whose masks contain values other than land/water.
+
+    SWED defines only label 0 (land) and label 1 (water), but some distributed
+    training tiles contain negative values. Entire samples containing those
+    values are excluded instead of silently converting invalid annotations.
+    """
+    valid_rows: list[bool] = []
+    water_pixels: list[int] = []
+    total_pixels: list[int] = []
+    for label_path in pairs["label_path"]:
+        mask = np.squeeze(SWEDDataset._load_array(label_path))
+        is_valid = mask.shape == IMAGE_SIZE and np.isin(mask, (0, 1)).all()
+        valid_rows.append(is_valid)
+        water_pixels.append(int(np.count_nonzero(mask == 1)) if is_valid else 0)
+        total_pixels.append(int(mask.size) if is_valid else 0)
+
+    annotated = pairs.assign(
+        water_pixels=water_pixels,
+        total_pixels=total_pixels,
+    )
+    valid = annotated.loc[valid_rows].reset_index(drop=True)
+    discarded = len(pairs) - len(valid)
+    if discarded:
+        print(f"Maschere non valide escluse: {discarded}/{len(pairs)}")
+    if valid.empty:
+        raise ValueError("Nessuna coppia con maschera binaria valida")
+    return valid
+
+
+def filter_invalid_images(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Discard pairs with unreadable or numerically invalid satellite images."""
+    valid_rows: list[bool] = []
+    for image_path in pairs["image_path"]:
+        try:
+            image = SWEDDataset._load_array(image_path)
+            has_valid_shape = (
+                image.ndim == 3
+                and (image.shape == (*IMAGE_SIZE, 12) or image.shape == (12, *IMAGE_SIZE))
+            )
+            is_numeric = np.issubdtype(image.dtype, np.number)
+            has_valid_values = (
+                is_numeric and np.isfinite(image).all() and np.all(image >= 0)
+            )
+            valid_rows.append(bool(has_valid_shape and has_valid_values))
+        except (OSError, ValueError, TypeError):
+            valid_rows.append(False)
+
+    valid = pairs.loc[valid_rows].reset_index(drop=True)
+    discarded = len(pairs) - len(valid)
+    if discarded:
+        print(f"Immagini non valide escluse: {discarded}/{len(pairs)}")
+    if valid.empty:
+        raise ValueError("Nessuna coppia con immagine valida")
+    return valid
+
+
 def normalize_for_satlas(image: np.ndarray) -> Tensor:
-    """Convert a raw 12-band SWED image into a SATLAS model input.
+    """
+    Convert a raw 12-band SWED image into a SATLAS model input.
 
     The function accepts both H x W x C and C x H x W arrays. It selects the
     nine bands used by SATLAS, scales reflectance values to [0, 1], and returns
@@ -167,21 +281,37 @@ def normalize_for_satlas(image: np.ndarray) -> Tensor:
 
 
 @dataclass(frozen=True)
-class RandomGeometricTransform:
-    """Randomly flip and rotate a training image together with its mask.
+class RandomTrainingTransform:
+    """
+    Apply geometric and mild radiometric augmentation to a training pair.
 
-    Applying the same transformation to both tensors keeps every mask pixel
-    aligned with the corresponding image pixel.
+    Geometric operations are shared by image and mask. Brightness, contrast,
+    and sensor-like Gaussian noise affect only the multispectral image.
     """
 
     horizontal_flip_probability: float = 0.5
     vertical_flip_probability: float = 0.5
     random_rotation_90: bool = True
+    radiometric_probability: float = 0.5
+    max_brightness_shift: float = 0.05
+    max_contrast_change: float = 0.15
+    noise_standard_deviation: float = 0.01
 
     def __post_init__(self) -> None:
-        for value in (self.horizontal_flip_probability, self.vertical_flip_probability):
+        for value in (
+            self.horizontal_flip_probability,
+            self.vertical_flip_probability,
+            self.radiometric_probability,
+        ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError("Le probabilità devono essere comprese tra 0 e 1")
+        for value in (
+            self.max_brightness_shift,
+            self.max_contrast_change,
+            self.noise_standard_deviation,
+        ):
+            if value < 0.0:
+                raise ValueError("Le intensità di augmentation non possono essere negative")
 
     def __call__(self, image: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         # Applying identical operations preserves pixel-to-label alignment.
@@ -193,11 +323,31 @@ class RandomGeometricTransform:
             turns = int(torch.randint(0, 4, ()).item())
             image = torch.rot90(image, turns, dims=(-2, -1))
             mask = torch.rot90(mask, turns, dims=(-2, -1))
+
+        if torch.rand(()) < self.radiometric_probability:
+            contrast = 1.0 + float(
+                torch.empty(()).uniform_(
+                    -self.max_contrast_change,
+                    self.max_contrast_change,
+                )
+            )
+            brightness = float(
+                torch.empty(()).uniform_(
+                    -self.max_brightness_shift,
+                    self.max_brightness_shift,
+                )
+            )
+            band_means = image.mean(dim=(-2, -1), keepdim=True)
+            image = (image - band_means) * contrast + band_means + brightness
+            if self.noise_standard_deviation > 0:
+                image = image + torch.randn_like(image) * self.noise_standard_deviation
+            image = image.clamp_(0.0, 1.0)
         return image.contiguous(), mask.contiguous()
 
 
 class SWEDDataset(Dataset[tuple[Tensor, Tensor]]):
-    """Provide normalized SWED images and binary masks to a DataLoader.
+    """
+    Provide normalized SWED images and binary masks to a DataLoader.
 
     Files are loaded only when a sample is requested, so the full dataset does
     not need to fit in memory. An optional transform can augment each pair.
@@ -246,7 +396,12 @@ class SWEDDataset(Dataset[tuple[Tensor, Tensor]]):
         if path.suffix.lower() in {".tif", ".tiff"}:
             import tifffile
 
-            return tifffile.imread(path)
+            logger = logging.getLogger("tifffile")
+            logger.addFilter(_TIFFFILE_LOG_FILTER)
+            try:
+                return tifffile.imread(path)
+            finally:
+                logger.removeFilter(_TIFFFILE_LOG_FILTER)
         raise ValueError(f"Formato non supportato: {path}")
 
 
@@ -258,17 +413,20 @@ def create_datasets(
     test_images_dir: str | Path = TEST_IMAGES_DIR,
     test_labels_dir: str | Path = TEST_LABELS_DIR,
 ) -> tuple[SWEDDataset, SWEDDataset, SWEDDataset]:
-    """Create the three datasets used by the complete model workflow.
+    """
+    Create the three datasets used by the complete model workflow.
 
     Training and validation samples come from the training folders and are
     split by scene. Training samples receive random augmentation; validation
     and test samples do not. The returned order is training, validation, test.
     """
+    # get_pairs removes non-binary masks before any split is performed.
     development_pairs = get_pairs(train_images_dir, train_labels_dir)
     train_pairs, validation_pairs = split_pairs(development_pairs, train_fraction, seed)
-    test_pairs = get_pairs(test_images_dir, test_labels_dir)
+    # Test GeoTIFF images receive an additional integrity/nodata validation.
+    test_pairs = get_pairs(test_images_dir, test_labels_dir, validate_images=True)
 
-    train_dataset = SWEDDataset(train_pairs, transform=RandomGeometricTransform())
+    train_dataset = SWEDDataset(train_pairs, transform=RandomTrainingTransform())
     validation_dataset = SWEDDataset(validation_pairs)
     test_dataset = SWEDDataset(test_pairs)
     return train_dataset, validation_dataset, test_dataset
