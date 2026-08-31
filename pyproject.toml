@@ -11,4 +11,6 @@ dependencies = [
     "satlaspretrain-models>=0.3.1",
     "tifffile>=2026.3.3",
     "torch>=2.13.0",
+    "torchvision>=0.24.0",
+    "tqdm>=4.67.1",
 ]

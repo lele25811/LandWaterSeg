@@ -1,14 +1,10 @@
-"""
-Prepare SWED images and masks for training a segmentation model.
+"""Prepare SWED images and masks for training a segmentation model.
 
-The workflow is:
-match every satellite image with its mask, split the data
-into training and validation sets, normalize the image bands, and create
-PyTorch datasets. A separate test set is also created for final evaluation.
+Samples from the ``train`` directory are paired, validated, split by scene
+into train/validation/test subsets, and converted into six-band PyTorch datasets.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from itertools import combinations
 import logging
 from pathlib import Path
@@ -18,28 +14,67 @@ import pandas as pd
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
+from torchvision import tv_tensors
+from torchvision.transforms import v2
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATASET_ROOT = PROJECT_ROOT / "Sentinel-2WaterDataset(SWED)" / "SWED"
 TRAIN_IMAGES_DIR = DATASET_ROOT / "train" / "images"
 TRAIN_LABELS_DIR = DATASET_ROOT / "train" / "labels"
-TEST_IMAGES_DIR = DATASET_ROOT / "test" / "images"
-TEST_LABELS_DIR = DATASET_ROOT / "test" / "labels"
+
+# Fractions applied to the single SWED/train data source.
+TRAIN_SPLIT_FRACTION = 0.50
+VALIDATION_SPLIT_FRACTION = 0.30
+TEST_SPLIT_FRACTION = 0.20
 
 IMAGE_SIZE = (256, 256)
 SUPPORTED_EXTENSIONS = {".npy", ".tif", ".tiff"}
 
-# SWED: B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B11, B12.
-# SATLAS Sentinel2_*_SI_MS: R, G, B, B05, B06, B07, B08, B11, B12.
-SATLAS_BAND_INDICES = (3, 2, 1, 4, 5, 6, 7, 10, 11)
-SATLAS_REFLECTANCE_SCALE = 8160.0
+# SWED order: B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B11, B12.
+# These indices select Blue, Green, Red, NIR, SWIR1, and SWIR2.
+SIX_BAND_INDICES = (1, 2, 3, 7, 10, 11)
+REFLECTANCE_SCALE = 8160.0
+
+TRAIN_TRANSFORM = v2.Compose(
+    [
+        # Flip the image and mask horizontally with 50% probability.
+        v2.RandomHorizontalFlip(p=0.5),
+        # Flip the image and mask vertically with 50% probability.
+        v2.RandomVerticalFlip(p=0.5),
+        # Uniformly choose one of four rotations, each with 25% probability.
+        # Identity corresponds to a 0-degree rotation.
+        v2.RandomChoice(
+            [
+                v2.Identity(),
+                v2.RandomRotation((90, 90)),
+                v2.RandomRotation((180, 180)),
+                v2.RandomRotation((270, 270)),
+            ]
+        ),
+        # Add Gaussian noise only to the image with 50% probability.
+        # mean=0 avoids a systematic brightness shift, sigma=0.01 controls
+        # noise intensity, and clip=True keeps values between 0 and 1.
+        v2.RandomApply(
+            [v2.GaussianNoise(mean=0.0, sigma=0.01, clip=True)],
+            p=0.5,
+        ),
+    ]
+)
 
 
 class _IgnoreInvalidGDALNoDataTag(logging.Filter):
-    """Hide only tifffile's harmless, out-of-range GDAL_NODATA tag warning."""
+    """Hide only the harmless warning related to GDAL_NODATA."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """Decide whether a log message should be displayed.
+
+        Args:
+            record: Message produced by the tifffile logger.
+
+        Returns:
+            ``False`` for the ignored GDAL_NODATA warning; otherwise ``True``.
+        """
         return "parsing GDAL_NODATA tag raised" not in record.getMessage()
 
 
@@ -47,12 +82,14 @@ _TIFFFILE_LOG_FILTER = _IgnoreInvalidGDALNoDataTag()
 
 
 def _sample_id(path: Path, markers: tuple[str, ...]) -> str | None:
-    """
-    Return the ID used to match an image file with its label file.
+    """Extract the common identifier used to pair an image with its mask.
 
-    The image and label filenames contain different markers. Replacing that
-    marker with ``_`` leaves the common part of the two filenames. If none of
-    the expected markers is present, return ``None``.
+    Args:
+        path: File path from which the identifier is extracted.
+        markers: Accepted filename markers, such as ``_image_``.
+
+    Returns:
+        Normalized identifier, or ``None`` when no marker is found.
     """
     for marker in markers:
         if marker in path.stem:
@@ -61,11 +98,14 @@ def _sample_id(path: Path, markers: tuple[str, ...]) -> str | None:
 
 
 def _index_files(directory: Path, markers: tuple[str, ...]) -> dict[str, Path]:
-    """
-    Map each valid sample ID to its file inside a directory.
+    """Index supported files by their normalized identifier.
 
-    Unsupported files and files without a known marker are ignored. Duplicate
-    IDs raise an error because they would make image-label pairing ambiguous.
+    Args:
+        directory: Directory containing images or masks.
+        markers: Markers recognized in filenames.
+
+    Returns:
+        Mapping from each identifier to its file path.
     """
     indexed: dict[str, Path] = {}
     for path in sorted(directory.iterdir()):
@@ -83,18 +123,15 @@ def _index_files(directory: Path, markers: tuple[str, ...]) -> dict[str, Path]:
 def get_pairs(
     images_dir: str | Path,
     labels_dir: str | Path,
-    validate_images: bool = False,
 ) -> pd.DataFrame:
-    """
-    Match every image with its label and return the valid pairs.
+    """Pair images with masks and remove pairs containing invalid masks.
 
-    Each output row contains the sample ID, image path, and label path. Files
-    are matched by the ID in their names, not by their position in a directory
-    listing. By default, pairs whose masks are not 256x256 binary arrays are
-    discarded immediately, before they can enter train, validation, or test.
-    ``validate_images=True`` additionally excludes unreadable images, invalid
-    shapes, NaN/Inf values, and negative nodata pixels. An error is raised if
-    a directory is invalid or a file has no partner.
+    Args:
+        images_dir: Directory containing satellite images.
+        labels_dir: Directory containing the corresponding masks.
+
+    Returns:
+        DataFrame containing IDs, paths, and pixel statistics for each pair.
     """
     images_dir = Path(images_dir)
     labels_dir = Path(labels_dir)
@@ -127,8 +164,7 @@ def get_pairs(
         }
         for sample_id in sorted(images)
     )
-    valid_pairs = filter_invalid_masks(pairs)
-    return filter_invalid_images(valid_pairs) if validate_images else valid_pairs
+    return filter_invalid_masks(pairs)
 
 
 def split_pairs(
@@ -136,13 +172,15 @@ def split_pairs(
     train_fraction: float = 0.8,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Divide paired samples into training and validation sets.
+    """Split pairs by scene while preserving water-pixel prevalence.
 
-    All tiles from the same satellite scene stay in the same set. This avoids
-    evaluating the model on tiles that are very similar to its training data.
-    ``train_fraction`` controls the share of scenes used for training, while
-    ``seed`` makes the split reproducible.
+    Args:
+        pairs: Pairs containing ``sample_id`` and pixel statistics.
+        train_fraction: Fraction assigned to the first returned split.
+        seed: Seed used for deterministic tie-breaking.
+
+    Returns:
+        First and second split DataFrames, with no shared scenes.
     """
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction deve essere compreso tra 0 e 1")
@@ -150,7 +188,7 @@ def split_pairs(
         raise ValueError("Il DataFrame deve contenere la colonna 'sample_id'")
 
     frame = pairs.copy()
-    # The final two fields are the row and column of the 256x256 tile.
+    # The final two ID fields represent the tile row and column.
     frame["scene_id"] = frame["sample_id"].str.rsplit("_", n=2).str[0]
     if (frame["scene_id"] == frame["sample_id"]).any():
         raise ValueError("Un sample_id non termina con '_riga_colonna'")
@@ -161,48 +199,105 @@ def split_pairs(
     split_at = min(max(round(len(scenes) * train_fraction), 1), len(scenes) - 1)
     validation_scene_count = len(scenes) - split_at
 
-    if {"water_pixels", "total_pixels"}.issubset(frame.columns):
-        # Choose complete validation scenes while matching both dataset size
-        # and water prevalence. This reduces class-prior shift without leaking
-        # adjacent tiles from the same scene across the two subsets.
-        scene_stats = frame.groupby("scene_id")[["water_pixels", "total_pixels"]].sum()
-        target_samples = len(frame) * (1.0 - train_fraction)
-        target_water_fraction = frame["water_pixels"].sum() / frame["total_pixels"].sum()
-        shuffled_scenes = scenes.copy()
-        random.Random(seed).shuffle(shuffled_scenes)
+    required_statistics = {"water_pixels", "total_pixels"}
+    if not required_statistics.issubset(frame.columns):
+        raise ValueError(
+            "Lo split richiede le colonne 'water_pixels' e 'total_pixels'"
+        )
 
-        best_score = float("inf")
-        validation_scenes: set[str] = set()
-        for candidate in combinations(shuffled_scenes, validation_scene_count):
-            candidate_frame = frame[frame["scene_id"].isin(candidate)]
-            candidate_stats = scene_stats.loc[list(candidate)].sum()
-            size_error = abs(len(candidate_frame) - target_samples) / len(frame)
-            water_fraction = (
-                candidate_stats["water_pixels"] / candidate_stats["total_pixels"]
-            )
-            prevalence_error = abs(water_fraction - target_water_fraction)
-            score = float(size_error + prevalence_error)
-            if score < best_score:
-                best_score = score
-                validation_scenes = set(candidate)
-        train_scenes = set(scenes) - validation_scenes
-    else:
-        # Preserve support for callers that provide only paths/sample IDs.
-        random.Random(seed).shuffle(scenes)
-        train_scenes = set(scenes[:split_at])
+    # Select complete scenes that match both the desired size and global water
+    # prevalence while preventing leakage between tiles from the same scene.
+    scene_stats = frame.groupby("scene_id")[["water_pixels", "total_pixels"]].sum()
+    scene_sample_counts = frame.groupby("scene_id").size()
+    target_samples = len(frame) * (1.0 - train_fraction)
+    target_water_fraction = frame["water_pixels"].sum() / frame["total_pixels"].sum()
+    shuffled_scenes = scenes.copy()
+    random.Random(seed).shuffle(shuffled_scenes)
+
+    best_score = float("inf")
+    validation_scenes: set[str] = set()
+    for candidate in combinations(shuffled_scenes, validation_scene_count):
+        candidate_names = list(candidate)
+        candidate_samples = int(scene_sample_counts.loc[candidate_names].sum())
+        candidate_stats = scene_stats.loc[candidate_names].sum()
+        size_error = abs(candidate_samples - target_samples) / len(frame)
+        water_fraction = (
+            candidate_stats["water_pixels"] / candidate_stats["total_pixels"]
+        )
+        prevalence_error = abs(water_fraction - target_water_fraction)
+        score = float(size_error + prevalence_error)
+        if score < best_score:
+            best_score = score
+            validation_scenes = set(candidate)
+    train_scenes = set(scenes) - validation_scenes
 
     train = frame[frame["scene_id"].isin(train_scenes)].reset_index(drop=True)
     validation = frame[~frame["scene_id"].isin(train_scenes)].reset_index(drop=True)
     return train, validation
 
 
-def filter_invalid_masks(pairs: pd.DataFrame) -> pd.DataFrame:
-    """
-    Discard samples whose masks contain values other than land/water.
+def split_pairs_train_validation_test(
+    pairs: pd.DataFrame,
+    train_fraction: float = TRAIN_SPLIT_FRACTION,
+    validation_fraction: float = VALIDATION_SPLIT_FRACTION,
+    test_fraction: float = TEST_SPLIT_FRACTION,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Create scene-disjoint splits with consistent water/land distribution.
 
-    SWED defines only label 0 (land) and label 1 (water), but some distributed
-    training tiles contain negative values. Entire samples containing those
-    values are excluded instead of silently converting invalid annotations.
+    Args:
+        pairs: Pairs containing identifiers and pixel statistics.
+        train_fraction: Overall fraction assigned to training.
+        validation_fraction: Overall fraction assigned to validation.
+        test_fraction: Overall fraction assigned to testing.
+        seed: Seed that makes the split reproducible.
+
+    Returns:
+        Train, validation, and test DataFrames, in this order.
+    """
+    fractions = (train_fraction, validation_fraction, test_fraction)
+    if any(fraction <= 0.0 for fraction in fractions):
+        raise ValueError("Le frazioni train, validation e test devono essere positive")
+    if not np.isclose(sum(fractions), 1.0):
+        raise ValueError("Le frazioni train, validation e test devono sommare a 1")
+
+    train, holdout = split_pairs(
+        pairs,
+        train_fraction=train_fraction,
+        seed=seed,
+    )
+    validation_share_of_holdout = validation_fraction / (
+        validation_fraction + test_fraction
+    )
+    validation, test = split_pairs(
+        holdout,
+        train_fraction=validation_share_of_holdout,
+        seed=seed + 1,
+    )
+
+    split_frames = {"train": train, "validation": validation, "test": test}
+    scene_sets = {
+        name: set(frame["scene_id"])
+        for name, frame in split_frames.items()
+    }
+    if (
+        scene_sets["train"] & scene_sets["validation"]
+        or scene_sets["train"] & scene_sets["test"]
+        or scene_sets["validation"] & scene_sets["test"]
+    ):
+        raise RuntimeError("Spatial leakage: una scena compare in più split")
+
+    return train, validation, test
+
+
+def filter_invalid_masks(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Keep binary 256x256 masks and calculate per-class pixel statistics.
+
+    Args:
+        pairs: DataFrame containing at least the ``label_path`` column.
+
+    Returns:
+        Valid pairs with ``water_pixels`` and ``total_pixels`` columns.
     """
     valid_rows: list[bool] = []
     water_pixels: list[int] = []
@@ -227,45 +322,19 @@ def filter_invalid_masks(pairs: pd.DataFrame) -> pd.DataFrame:
     return valid
 
 
-def filter_invalid_images(pairs: pd.DataFrame) -> pd.DataFrame:
-    """Discard pairs with unreadable or numerically invalid satellite images."""
-    valid_rows: list[bool] = []
-    for image_path in pairs["image_path"]:
-        try:
-            image = SWEDDataset._load_array(image_path)
-            has_valid_shape = (
-                image.ndim == 3
-                and (image.shape == (*IMAGE_SIZE, 12) or image.shape == (12, *IMAGE_SIZE))
-            )
-            is_numeric = np.issubdtype(image.dtype, np.number)
-            has_valid_values = (
-                is_numeric and np.isfinite(image).all() and np.all(image >= 0)
-            )
-            valid_rows.append(bool(has_valid_shape and has_valid_values))
-        except (OSError, ValueError, TypeError):
-            valid_rows.append(False)
+def normalize_six_bands(image: np.ndarray) -> Tensor:
+    """Select and normalize the six bands used by the model.
 
-    valid = pairs.loc[valid_rows].reset_index(drop=True)
-    discarded = len(pairs) - len(valid)
-    if discarded:
-        print(f"Immagini non valide escluse: {discarded}/{len(pairs)}")
-    if valid.empty:
-        raise ValueError("Nessuna coppia con immagine valida")
-    return valid
+    Args:
+        image: Raw 12-band SWED array in HWC or CHW format.
 
-
-def normalize_for_satlas(image: np.ndarray) -> Tensor:
-    """
-    Convert a raw 12-band SWED image into a SATLAS model input.
-
-    The function accepts both H x W x C and C x H x W arrays. It selects the
-    nine bands used by SATLAS, scales reflectance values to [0, 1], and returns
-    a float32 tensor arranged as C x H x W.
+    Returns:
+        Float32 tensor shaped ``[6, 256, 256]`` with values between 0 and 1.
     """
     if image.ndim != 3:
         raise ValueError(f"Immagine a 3 dimensioni attesa, ricevuta {image.shape}")
 
-    # Training .npy files use HWC; test GeoTIFF files may use CHW.
+    # Accept both dimension orders found in the supported files.
     if image.shape[-1] == 12:
         image_hwc = image
     elif image.shape[0] == 12:
@@ -274,90 +343,41 @@ def normalize_for_satlas(image: np.ndarray) -> Tensor:
         raise ValueError(f"Immagine a 12 bande attesa, ricevuta {image.shape}")
     if image_hwc.shape[:2] != IMAGE_SIZE:
         raise ValueError(f"Immagine {IMAGE_SIZE} attesa, ricevuta {image_hwc.shape[:2]}")
-
-    selected = image_hwc[..., SATLAS_BAND_INDICES].astype(np.float32, copy=False)
-    selected = np.clip(selected / SATLAS_REFLECTANCE_SCALE, 0.0, 1.0)
+    selected = image_hwc[..., SIX_BAND_INDICES].astype(np.float32, copy=False)
+    selected = np.clip(selected / REFLECTANCE_SCALE, 0.0, 1.0)
     return torch.from_numpy(selected).permute(2, 0, 1).contiguous()
 
 
-@dataclass(frozen=True)
-class RandomTrainingTransform:
+def random_training_transform(image: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+    """Apply synchronized random augmentation to an image and its mask.
+
+    Args:
+        image: Normalized six-band image.
+        mask: Binary mask associated with the image.
+
+    Returns:
+        Transformed image and geometrically aligned mask.
     """
-    Apply geometric and mild radiometric augmentation to a training pair.
-
-    Geometric operations are shared by image and mask. Brightness, contrast,
-    and sensor-like Gaussian noise affect only the multispectral image.
-    """
-
-    horizontal_flip_probability: float = 0.5
-    vertical_flip_probability: float = 0.5
-    random_rotation_90: bool = True
-    radiometric_probability: float = 0.5
-    max_brightness_shift: float = 0.05
-    max_contrast_change: float = 0.15
-    noise_standard_deviation: float = 0.01
-
-    def __post_init__(self) -> None:
-        for value in (
-            self.horizontal_flip_probability,
-            self.vertical_flip_probability,
-            self.radiometric_probability,
-        ):
-            if not 0.0 <= value <= 1.0:
-                raise ValueError("Le probabilità devono essere comprese tra 0 e 1")
-        for value in (
-            self.max_brightness_shift,
-            self.max_contrast_change,
-            self.noise_standard_deviation,
-        ):
-            if value < 0.0:
-                raise ValueError("Le intensità di augmentation non possono essere negative")
-
-    def __call__(self, image: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-        # Applying identical operations preserves pixel-to-label alignment.
-        if torch.rand(()) < self.horizontal_flip_probability:
-            image, mask = image.flip(-1), mask.flip(-1)
-        if torch.rand(()) < self.vertical_flip_probability:
-            image, mask = image.flip(-2), mask.flip(-2)
-        if self.random_rotation_90:
-            turns = int(torch.randint(0, 4, ()).item())
-            image = torch.rot90(image, turns, dims=(-2, -1))
-            mask = torch.rot90(mask, turns, dims=(-2, -1))
-
-        if torch.rand(()) < self.radiometric_probability:
-            contrast = 1.0 + float(
-                torch.empty(()).uniform_(
-                    -self.max_contrast_change,
-                    self.max_contrast_change,
-                )
-            )
-            brightness = float(
-                torch.empty(()).uniform_(
-                    -self.max_brightness_shift,
-                    self.max_brightness_shift,
-                )
-            )
-            band_means = image.mean(dim=(-2, -1), keepdim=True)
-            image = (image - band_means) * contrast + band_means + brightness
-            if self.noise_standard_deviation > 0:
-                image = image + torch.randn_like(image) * self.noise_standard_deviation
-            image = image.clamp_(0.0, 1.0)
-        return image.contiguous(), mask.contiguous()
+    # The Mask type synchronizes geometric transforms and excludes the mask
+    # from image-only transforms such as noise.
+    image, mask = TRAIN_TRANSFORM(image, tv_tensors.Mask(mask))
+    return image.contiguous(), mask.as_subclass(torch.Tensor).contiguous()
 
 
 class SWEDDataset(Dataset[tuple[Tensor, Tensor]]):
-    """
-    Provide normalized SWED images and binary masks to a DataLoader.
-
-    Files are loaded only when a sample is requested, so the full dataset does
-    not need to fit in memory. An optional transform can augment each pair.
-    """
+    """PyTorch dataset that lazily loads SWED images and binary masks."""
 
     def __init__(
         self,
         pairs: pd.DataFrame,
         transform: Callable[[Tensor, Tensor], tuple[Tensor, Tensor]] | None = None,
     ) -> None:
+        """Initialize the dataset.
+
+        Args:
+            pairs: DataFrame containing image and mask paths.
+            transform: Optional function jointly applied to the pair.
+        """
         required = {"image_path", "label_path"}
         if missing := required - set(pairs.columns):
             raise ValueError(f"Colonne mancanti nel DataFrame: {sorted(missing)}")
@@ -365,12 +385,21 @@ class SWEDDataset(Dataset[tuple[Tensor, Tensor]]):
         self.transform = transform
 
     def __len__(self) -> int:
+        """Return the number of image-mask pairs in the dataset."""
         return len(self.pairs)
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
-        # Lazy loading avoids keeping the entire dataset in memory.
+        """Load and prepare one sample.
+
+        Args:
+            index: Position of the requested sample.
+
+        Returns:
+            Six-band image tensor and binary mask tensor.
+        """
+        # Load data on demand instead of keeping the entire dataset in memory.
         row = self.pairs.iloc[index]
-        image = normalize_for_satlas(self._load_array(row["image_path"]))
+        image = normalize_six_bands(self._load_array(row["image_path"]))
         mask_array = np.squeeze(self._load_array(row["label_path"]))
 
         if mask_array.shape != IMAGE_SIZE:
@@ -380,7 +409,7 @@ class SWEDDataset(Dataset[tuple[Tensor, Tensor]]):
             )
         if not np.isin(mask_array, (0, 1)).all():
             raise ValueError(f"La maschera non è binaria: {row['label_path']}")
-        # Loss functions such as CrossEntropyLoss expect int64/long masks.
+        # CrossEntropyLoss expects class indices in int64/long format.
         mask = torch.from_numpy(mask_array.astype(np.int64, copy=False))
 
         if self.transform is not None:
@@ -389,7 +418,14 @@ class SWEDDataset(Dataset[tuple[Tensor, Tensor]]):
 
     @staticmethod
     def _load_array(path: str | Path) -> np.ndarray:
-        """Read a supported NumPy or TIFF file and return its values as an array."""
+        """Read a supported NumPy or TIFF file.
+
+        Args:
+            path: Path to the ``.npy``, ``.tif``, or ``.tiff`` file.
+
+        Returns:
+            File contents as a NumPy array.
+        """
         path = Path(path)
         if path.suffix.lower() == ".npy":
             return np.load(path, allow_pickle=False)
@@ -406,34 +442,46 @@ class SWEDDataset(Dataset[tuple[Tensor, Tensor]]):
 
 
 def create_datasets(
-    train_fraction: float = 0.8,
     seed: int = 42,
     train_images_dir: str | Path = TRAIN_IMAGES_DIR,
     train_labels_dir: str | Path = TRAIN_LABELS_DIR,
-    test_images_dir: str | Path = TEST_IMAGES_DIR,
-    test_labels_dir: str | Path = TEST_LABELS_DIR,
+    train_fraction: float = TRAIN_SPLIT_FRACTION,
+    validation_fraction: float = VALIDATION_SPLIT_FRACTION,
+    test_fraction: float = TEST_SPLIT_FRACTION,
 ) -> tuple[SWEDDataset, SWEDDataset, SWEDDataset]:
-    """
-    Create the three datasets used by the complete model workflow.
+    """Build the three PyTorch datasets from the SWED/train directory.
 
-    Training and validation samples come from the training folders and are
-    split by scene. Training samples receive random augmentation; validation
-    and test samples do not. The returned order is training, validation, test.
+    Args:
+        seed: Seed used for reproducible splitting.
+        train_images_dir: Directory containing source images.
+        train_labels_dir: Directory containing source masks.
+        train_fraction: Fraction assigned to training.
+        validation_fraction: Fraction assigned to validation.
+        test_fraction: Fraction assigned to testing.
+
+    Returns:
+        Training, validation, and test datasets, in this order.
     """
-    # get_pairs removes non-binary masks before any split is performed.
+    # Remove invalid masks before performing any split.
     development_pairs = get_pairs(train_images_dir, train_labels_dir)
-    train_pairs, validation_pairs = split_pairs(development_pairs, train_fraction, seed)
-    # Test GeoTIFF images receive an additional integrity/nodata validation.
-    test_pairs = get_pairs(test_images_dir, test_labels_dir, validate_images=True)
+    train_pairs, validation_pairs, test_pairs = split_pairs_train_validation_test(
+        development_pairs,
+        train_fraction=train_fraction,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        seed=seed,
+    )
 
-    train_dataset = SWEDDataset(train_pairs, transform=RandomTrainingTransform())
+    train_dataset = SWEDDataset(
+        train_pairs,
+        transform=random_training_transform,
+    )
     validation_dataset = SWEDDataset(validation_pairs)
     test_dataset = SWEDDataset(test_pairs)
     return train_dataset, validation_dataset, test_dataset
 
 
 if __name__ == "__main__":
-    # This smoke test scans the filesystem only when the module runs as a script.
     train_dataset, validation_dataset, test_dataset = create_datasets()
     image, mask = train_dataset[0]
     print(f"Campioni: train={len(train_dataset)}, val={len(validation_dataset)}, test={len(test_dataset)}")
