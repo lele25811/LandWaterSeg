@@ -56,8 +56,8 @@ TRAIN_TRANSFORM = v2.Compose(
         # mean=0 avoids a systematic brightness shift, sigma=0.01 controls
         # noise intensity, and clip=True keeps values between 0 and 1.
         v2.RandomApply(
-            [v2.GaussianNoise(mean=0.0, sigma=0.01, clip=True)],
-            p=0.5,
+            [v2.GaussianNoise(mean=0.0, sigma=0.005, clip=True)],
+            p=0.3,
         ),
     ]
 )
